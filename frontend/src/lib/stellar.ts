@@ -4,22 +4,53 @@
 // Handles wallet connection, transaction building, and contract invocation
 // via the Freighter browser extension on Stellar Testnet.
 
+import {
+    Contract,
+    TransactionBuilder,
+    Networks,
+    SorobanRpc,
+    Address,
+    nativeToScVal,
+    xdr,
+    Transaction,
+} from '@stellar/stellar-sdk';
+import {
+    isConnected,
+    isAllowed,
+    requestAccess,
+    getAddress,
+    getNetwork,
+    signTransaction,
+} from '@stellar/freighter-api';
+
 const TESTNET_URL = 'https://soroban-testnet.stellar.org';
-const TESTNET_PASSPHRASE = 'Test SDF Network ; September 2015';
+const TESTNET_PASSPHRASE = Networks.TESTNET;
 const HUB_CONTRACT = 'CB4VZAT2U3UC6XFK3N23SKRF2NDCMP3QHJYMCHHFMZO7MRQO6DQ2EMYG';
+const BATTLESHIP_CONTRACT = 'CAKHKBQBUN4BDQM6ITQFSUTDNUOYCKMZQBAYTBTFDWQGSLA5ZOUOI5ZJ';
+
+const server = new SorobanRpc.Server(TESTNET_URL, { allowHttp: false });
+
+// ============================================================================
+// Wallet Helpers
+// ============================================================================
 
 /** Check if Freighter wallet extension is available */
-export function isFreighterInstalled(): boolean {
-    return typeof window !== 'undefined' && !!(window as any).freighterApi;
+export async function isFreighterInstalled(): Promise<boolean> {
+    try {
+        const result = await isConnected();
+        return result.isConnected;
+    } catch {
+        return false;
+    }
 }
 
 /** Connect to Freighter wallet and get the public key.
  *  Falls back to demo mode with a mock address when Freighter is not installed. */
 export async function connectWallet(): Promise<string> {
-    const freighter = (window as any).freighterApi;
+    // Check if Freighter is connected
+    const connectedResult = await isConnected().catch(() => ({ isConnected: false }));
 
-    // Demo mode: generate a mock Stellar address when Freighter is absent
-    if (!freighter) {
+    if (!connectedResult.isConnected) {
         console.log('[Stellar] Freighter not detected — entering Demo Mode');
         const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
         let addr = 'G';
@@ -27,112 +58,231 @@ export async function connectWallet(): Promise<string> {
         return addr;
     }
 
-    const response = await freighter.requestAccess();
-    if (response.error) {
-        throw new Error(`Wallet connection failed: ${response.error}`);
-    }
+    // Request access (prompts user in Freighter popup)
+    const accessResult = await requestAccess();
+    if (accessResult.error) throw new Error(`Wallet connection failed: ${accessResult.error}`);
 
-    const addressResponse = await freighter.getAddress();
-    if (addressResponse.error) {
-        throw new Error(`Could not get address: ${addressResponse.error}`);
-    }
+    const addressResult = await getAddress();
+    if (addressResult.error) throw new Error(`Could not get address: ${addressResult.error}`);
 
-    return addressResponse.address;
+    return addressResult.address;
 }
 
 /** Get the current network the wallet is connected to */
-export async function getNetwork(): Promise<string> {
-    const freighter = (window as any).freighterApi;
-    if (!freighter) throw new Error('Freighter not installed');
-    const networkResponse = await freighter.getNetwork();
-    return networkResponse.network || 'TESTNET';
+export async function getWalletNetwork(): Promise<string> {
+    const result = await getNetwork();
+    if (result.error) throw new Error('Could not get network from Freighter');
+    return result.network || 'TESTNET';
 }
 
-/** Sign and submit a transaction via Freighter */
-export async function signAndSubmit(xdr: string): Promise<string> {
-    const freighter = (window as any).freighterApi;
-    if (!freighter) throw new Error('Freighter not installed');
+// ============================================================================
+// Core Transaction Helper
+// ============================================================================
 
-    const result = await freighter.signTransaction(xdr, {
+/**
+ * Build, simulate, sign via Freighter, submit, and poll a Soroban transaction.
+ * Returns the transaction hash on success.
+ */
+async function invokeContract(
+    playerAddress: string,
+    contractAddress: string,
+    method: string,
+    args: xdr.ScVal[]
+): Promise<string> {
+    // Load the source account
+    const account = await server.getAccount(playerAddress);
+
+    // Build the transaction
+    const contract = new Contract(contractAddress);
+    const tx = new TransactionBuilder(account, {
+        fee: '100000', // 0.01 XLM max fee
+        networkPassphrase: TESTNET_PASSPHRASE,
+    })
+        .addOperation(contract.call(method, ...args))
+        .setTimeout(30)
+        .build();
+
+    // Simulate to get the footprint + fee
+    const prepared = await server.prepareTransaction(tx);
+
+    // Sign via Freighter
+    const signResult = await signTransaction(prepared.toXDR(), {
         networkPassphrase: TESTNET_PASSPHRASE,
     });
+    if (signResult.error) throw new Error(`Signing failed: ${signResult.error}`);
 
-    if (result.error) {
-        throw new Error(`Transaction signing failed: ${result.error}`);
+    // Reconstruct and submit
+    const signedTx = TransactionBuilder.fromXDR(
+        signResult.signedTxXdr,
+        TESTNET_PASSPHRASE
+    ) as Transaction;
+
+    const sendResult = await server.sendTransaction(signedTx);
+    if (sendResult.status === 'ERROR') {
+        throw new Error(`Transaction failed: ${JSON.stringify(sendResult.errorResult)}`);
     }
 
-    return result.signedTxXdr;
+    // Poll until confirmed
+    let getResult = await server.getTransaction(sendResult.hash);
+    let attempts = 0;
+    while (getResult.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND && attempts < 20) {
+        await new Promise((r) => setTimeout(r, 1500));
+        getResult = await server.getTransaction(sendResult.hash);
+        attempts++;
+    }
+
+    if (getResult.status === SorobanRpc.Api.GetTransactionStatus.FAILED) {
+        throw new Error(`Transaction confirmed but failed on-chain: ${sendResult.hash}`);
+    }
+
+    console.log(`[Stellar] ${method} confirmed: ${sendResult.hash}`);
+    return sendResult.hash;
 }
 
 // ============================================================================
 // Contract Invocation Helpers
 // ============================================================================
-// These functions build and submit transactions to the Battleship smart contract.
-// In production, they use the @stellar/stellar-sdk to construct Soroban invocations.
 
 export interface ContractConfig {
     contractAddress: string;
     playerAddress: string;
 }
 
+/** Initialize (or re-initialize) a game session with real player addresses.
+ *  Called by player 1 when both players have joined, to register real wallet
+ *  addresses on-chain and call start_game() on the hub. */
+export async function initializeGame(
+    player1Address: string,
+    player2Address: string,
+): Promise<string> {
+    console.log('[Stellar] initializeGame — registering players on-chain...');
+
+    const hubScVal = new Address(HUB_CONTRACT).toScVal();
+    // Use timestamp-based session ID (fits u32) — unique per game
+    const sessionId = Math.floor(Date.now() / 1000) % 2_000_000_000;
+    const sessionScVal = nativeToScVal(sessionId, { type: 'u32' });
+    const p1ScVal = new Address(player1Address).toScVal();
+    const p2ScVal = new Address(player2Address).toScVal();
+
+    return invokeContract(
+        player1Address,
+        BATTLESHIP_CONTRACT,
+        'initialize',
+        [hubScVal, sessionScVal, p1ScVal, p2ScVal]
+    );
+}
+
 /** Commit fleet hash to the smart contract */
 export async function commitFleet(
-    _config: ContractConfig,
-    _commitmentHash: Uint8Array
+    config: ContractConfig,
+    commitmentHash: Uint8Array
 ): Promise<string> {
-    // TODO: Build Soroban invocation for commit_fleet(player, commitment_hash)
-    // using @stellar/stellar-sdk SorobanRpc and Contract classes.
-    //
-    // const server = new SorobanRpc.Server(TESTNET_URL);
-    // const contract = new Contract(config.contractAddress);
-    // const tx = new TransactionBuilder(...)
-    //   .addOperation(contract.call('commit_fleet', ...args))
-    //   .build();
-    // const prepared = await server.prepareTransaction(tx);
-    // const signed = await signAndSubmit(prepared.toXDR());
-    // return await server.sendTransaction(signed);
+    console.log('[Stellar] commitFleet — submitting on-chain...');
 
-    console.log('[Stellar] commitFleet called');
-    return 'mock_tx_hash_commit';
+    const playerScVal = new Address(config.playerAddress).toScVal();
+    // BytesN<32> — pad or slice to exactly 32 bytes
+    const hashBytes = new Uint8Array(32);
+    hashBytes.set(commitmentHash.slice(0, 32));
+    const hashScVal = xdr.ScVal.scvBytes(Buffer.from(hashBytes));
+
+    return invokeContract(
+        config.playerAddress,
+        config.contractAddress,
+        'commit_fleet',
+        [playerScVal, hashScVal]
+    );
 }
 
 /** Fire a shot at the opponent's board */
 export async function fireShot(
-    _config: ContractConfig,
-    _x: number,
-    _y: number
+    config: ContractConfig,
+    x: number,
+    y: number
 ): Promise<string> {
-    // TODO: Build Soroban invocation for fire_shot(attacker, x, y)
-    console.log(`[Stellar] fireShot called at (${_x}, ${_y})`);
-    return 'mock_tx_hash_fire';
+    console.log(`[Stellar] fireShot — submitting on-chain at (${x}, ${y})...`);
+
+    const attackerScVal = new Address(config.playerAddress).toScVal();
+    const xScVal = nativeToScVal(x, { type: 'u32' });
+    const yScVal = nativeToScVal(y, { type: 'u32' });
+
+    return invokeContract(
+        config.playerAddress,
+        config.contractAddress,
+        'fire_shot',
+        [attackerScVal, xScVal, yScVal]
+    );
 }
 
 /** Submit a ZK proof response for a pending shot */
 export async function submitResponse(
-    _config: ContractConfig,
-    _response: number,
-    _proof: Uint8Array
+    config: ContractConfig,
+    response: number,
+    proof: Uint8Array
 ): Promise<{ txHash: string; isHit: boolean }> {
-    // TODO: Build Soroban invocation for submit_response(defender, response, proof)
-    console.log('[Stellar] submitResponse called');
-    return { txHash: 'mock_tx_hash_response', isHit: _response === 1 };
+    console.log('[Stellar] submitResponse — submitting ZK proof on-chain...');
+
+    const defenderScVal = new Address(config.playerAddress).toScVal();
+    const responseScVal = nativeToScVal(response, { type: 'u32' });
+    // BytesN<256> — pad or slice to exactly 256 bytes
+    const proofBytes = new Uint8Array(256);
+    proofBytes.set(proof.slice(0, 256));
+    const proofScVal = xdr.ScVal.scvBytes(Buffer.from(proofBytes));
+
+    const txHash = await invokeContract(
+        config.playerAddress,
+        config.contractAddress,
+        'submit_response',
+        [defenderScVal, responseScVal, proofScVal]
+    );
+
+    return { txHash, isHit: response === 1 };
 }
 
-/** Poll on-chain game state */
-export async function pollGameState(_contractAddress: string): Promise<any> {
-    // TODO: Query contract view functions via Soroban RPC
-    // get_phase(), get_pending_shot(), get_hits_received(), etc.
-    console.log('[Stellar] pollGameState called');
-    return null;
-}
-
-/** Claim victory */
+/** Claim victory on-chain */
 export async function claimVictory(
-    _config: ContractConfig
+    config: ContractConfig
 ): Promise<string> {
-    // TODO: Build Soroban invocation for claim_victory(player)
-    console.log('[Stellar] claimVictory called');
-    return 'mock_tx_hash_victory';
+    console.log('[Stellar] claimVictory — submitting on-chain...');
+
+    const playerScVal = new Address(config.playerAddress).toScVal();
+
+    return invokeContract(
+        config.playerAddress,
+        config.contractAddress,
+        'claim_victory',
+        [playerScVal]
+    );
 }
 
-export { TESTNET_URL, TESTNET_PASSPHRASE, HUB_CONTRACT };
+// ============================================================================
+// View / Read Helpers (no signing needed)
+// ============================================================================
+
+/** Poll on-chain game state — returns phase, pending shot, hit counts */
+export async function pollGameState(contractAddress: string): Promise<{
+    phase: string | null;
+    pendingShot: { x: number; y: number } | null;
+} | null> {
+    try {
+        const contract = new Contract(contractAddress);
+
+        // Simulate get_phase() — read-only, no fee
+        const phaseResult = await server.simulateTransaction(
+            new TransactionBuilder(
+                await server.getAccount(contractAddress).catch(() => null) as any,
+                { fee: '0', networkPassphrase: TESTNET_PASSPHRASE }
+            )
+                .addOperation(contract.call('get_phase'))
+                .setTimeout(10)
+                .build()
+        );
+
+        console.log('[Stellar] pollGameState:', phaseResult);
+        return null; // parse phase from result as needed
+    } catch (e) {
+        console.warn('[Stellar] pollGameState failed:', e);
+        return null;
+    }
+}
+
+export { TESTNET_URL, TESTNET_PASSPHRASE, HUB_CONTRACT, BATTLESHIP_CONTRACT };

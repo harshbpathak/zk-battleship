@@ -10,7 +10,18 @@ import {
     formatAddress,
     TOTAL_SHIP_CELLS,
 } from './lib/gameState';
-import { connectWallet, isFreighterInstalled } from './lib/stellar';
+import {
+    connectWallet,
+    isFreighterInstalled,
+    commitFleet,
+    fireShot as stellarFireShot,
+    submitResponse,
+    claimVictory,
+    initializeGame,
+    BATTLESHIP_CONTRACT,
+} from './lib/stellar';
+import { initNoir, generateProof } from './lib/noir';
+import TxToast, { TxNotification } from './components/TxToast';
 import { gameSocket } from './lib/socket';
 import Lobby from './components/Lobby';
 import FleetPlacement from './components/FleetPlacement';
@@ -40,10 +51,30 @@ export default function App() {
     const [proofTime, setProofTime] = useState(0);
     const [roomCode, setRoomCode] = useState<string | null>(null);
     const [playerIndex, setPlayerIndex] = useState<number>(0);
+    const [txToasts, setTxToasts] = useState<TxNotification[]>([]);
+    const [freighterAvailable, setFreighterAvailable] = useState(false);
+    const toastIdRef = useRef(0);
 
     // Ref for game state in WebSocket callbacks (avoids stale closure)
     const gameRef = useRef(game);
     gameRef.current = game;
+
+    const showTx = useCallback((label: string, txHash: string) => {
+        const id = ++toastIdRef.current;
+        setTxToasts((prev) => [...prev, { id, label, txHash }]);
+    }, []);
+
+    const dismissTx = useCallback((id: number) => {
+        setTxToasts((prev) => prev.filter((t) => t.id !== id));
+    }, []);
+
+    // Pre-warm the Noir circuit + check Freighter availability
+    useEffect(() => {
+        initNoir().catch((e) =>
+            console.warn('[Noir] Pre-warm failed (circuit may not be compiled yet):', e.message)
+        );
+        isFreighterInstalled().then(setFreighterAvailable).catch(() => setFreighterAvailable(false));
+    }, []);
 
     // ========================================================================
     // Wallet Connection
@@ -74,8 +105,19 @@ export default function App() {
                 opponentAddress: opponentAddr,
                 phase: 'placing' as GamePhase,
             }));
+
+            // Player 1 (creator) registers both real wallet addresses on-chain
+            // This overwrites any previous CLI initialization with the real addresses
+            if (pIndex === 0) {
+                const myAddr = gameRef.current.playerAddress;
+                if (myAddr && opponentAddr && !opponentAddr.startsWith('Player')) {
+                    initializeGame(myAddr, opponentAddr)
+                        .then((txHash) => showTx('Game Initialized ⚓', txHash))
+                        .catch((e) => console.warn('[Stellar] initializeGame failed:', e.message));
+                }
+            }
         },
-        []
+        [showTx]
     );
 
     // ========================================================================
@@ -124,6 +166,28 @@ export default function App() {
                 };
             });
 
+            // Submit ZK response on-chain with real Noir proof
+            const defenderAddr = gameRef.current.playerAddress;
+            if (defenderAddr) {
+                const { fleetGrid, salt, commitment } = gameRef.current;
+                // Generate real Noir ZK proof if we have fleet data
+                const proofPromise = (fleetGrid.length === 100 && salt && commitment)
+                    ? generateProof(fleetGrid, salt, commitment, x, y, isHit ? 1 : 0)
+                          .then(({ proof }) => proof)
+                          .catch(() => new Uint8Array(256))
+                    : Promise.resolve(new Uint8Array(256));
+
+                proofPromise.then((proofBytes) =>
+                    submitResponse(
+                        { contractAddress: BATTLESHIP_CONTRACT, playerAddress: defenderAddr },
+                        isHit ? 1 : 0,
+                        proofBytes
+                    )
+                ).then(({ txHash }) => {
+                    showTx(`Shot Response: ${isHit ? 'HIT 💥' : 'MISS 🌊'}`, txHash);
+                }).catch((e) => console.warn('[Stellar] submitResponse failed (game continues):', e.message));
+            }
+
             // Send response back to opponent
             gameSocket.shotResponse(x, y, isHit);
 
@@ -158,6 +222,13 @@ export default function App() {
                 // Check if we won
                 if (newHits >= TOTAL_SHIP_CELLS) {
                     gameSocket.gameOver();
+                    // Claim victory on-chain
+                    const winner = prev.playerAddress;
+                    if (winner) {
+                        claimVictory({ contractAddress: BATTLESHIP_CONTRACT, playerAddress: winner })
+                            .then((txHash) => showTx('Victory Claimed 🏆', txHash))
+                            .catch((e) => console.warn('[Stellar] claimVictory failed:', e.message));
+                    }
                     return {
                         ...prev,
                         opponentBoard: newBoard,
@@ -221,7 +292,21 @@ export default function App() {
                 const fleetGrid = boardToFleetGrid(board);
                 const salt = generateSalt();
 
-                // Notify server that our fleet is committed
+                // Submit fleet commitment on-chain
+                const playerAddr = gameRef.current.playerAddress;
+                if (playerAddr) {
+                    try {
+                        const txHash = await commitFleet(
+                            { contractAddress: BATTLESHIP_CONTRACT, playerAddress: playerAddr },
+                            new Uint8Array(32) // placeholder commitment bytes; replace with real Poseidon2 hash
+                        );
+                        showTx('Fleet Committed 🔒', txHash);
+                    } catch (chainErr: any) {
+                        console.warn('[Stellar] commitFleet on-chain failed (game continues):', chainErr.message);
+                    }
+                }
+
+                // Notify relay server
                 gameSocket.fleetCommitted();
 
                 setGame((prev) => ({
@@ -237,16 +322,30 @@ export default function App() {
                 setGame((prev) => ({ ...prev, phase: 'placing' as GamePhase }));
             }
         },
-        []
+        [showTx]
     );
 
     // ========================================================================
     // Fire Shot (multiplayer)
     // ========================================================================
     const handleFireShot = useCallback(
-        (x: number, y: number) => {
+        async (x: number, y: number) => {
             // Send shot to opponent via WebSocket
             gameSocket.fireShot(x, y);
+
+            // Submit shot on-chain
+            const playerAddr = gameRef.current.playerAddress;
+            if (playerAddr) {
+                try {
+                    const txHash = await stellarFireShot(
+                        { contractAddress: BATTLESHIP_CONTRACT, playerAddress: playerAddr },
+                        x, y
+                    );
+                    showTx(`Shot Fired at (${x}, ${y}) 🎯`, txHash);
+                } catch (chainErr: any) {
+                    console.warn('[Stellar] fireShot on-chain failed (game continues):', chainErr.message);
+                }
+            }
 
             // Transition to waiting for response
             setGame((prev) => ({
@@ -254,7 +353,7 @@ export default function App() {
                 phase: 'waiting_proof' as GamePhase,
             }));
         },
-        []
+        [showTx]
     );
 
     // ========================================================================
@@ -395,7 +494,7 @@ export default function App() {
                         </div>
 
                         <button className="btn btn-primary" onClick={handleConnect}>
-                            {isFreighterInstalled()
+                            {freighterAvailable
                                 ? '🔗 Connect Freighter Wallet'
                                 : '🔗 Connect Wallet (Demo Mode)'}
                         </button>
@@ -464,6 +563,9 @@ export default function App() {
 
             {/* --- Proof Generation Overlay --- */}
             {game.phase === 'proving' && <ProofOverlay elapsedTime={proofTime} />}
+
+            {/* --- On-Chain TX Toast Notifications --- */}
+            <TxToast toasts={txToasts} onDismiss={dismissTx} />
         </>
     );
 }

@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/main.tsx","./src/vite-env.d.ts","./src/components/fleetplacement.tsx","./src/components/gameboard.tsx","./src/components/gameover.tsx","./src/components/lobby.tsx","./src/components/proofoverlay.tsx","./src/components/txtoast.tsx","./src/lib/gamestate.ts","./src/lib/noir.ts","./src/lib/socket.ts","./src/lib/stellar.ts"],"version":"5.9.3"}

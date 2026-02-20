@@ -4,9 +4,13 @@
 // Manages the connection to the relay server and provides a clean API
 // for sending/receiving game messages.
 
-// Auto-detect hostname so it works both locally and across the network
+// Auto-detect: use wss:// for deployed HTTPS, ws:// for local dev
 const WS_HOST = typeof window !== 'undefined' ? window.location.hostname : 'localhost';
-const WS_URL = `ws://${WS_HOST}:3001`;
+const IS_LOCAL = WS_HOST === 'localhost' || WS_HOST.startsWith('172.') || WS_HOST.startsWith('192.') || WS_HOST.startsWith('10.');
+
+// Production WS server (Railway). For local dev, falls back to ws://localhost:3001
+const PROD_WS_URL = 'wss://REPLACE_WITH_YOUR_RAILWAY_URL';
+const WS_URL = IS_LOCAL ? `ws://${WS_HOST}:3001` : PROD_WS_URL;
 
 export type MessageHandler = (msg: any) => void;
 

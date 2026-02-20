@@ -11,11 +11,11 @@ export default defineConfig({
     },
     optimizeDeps: {
         esbuildOptions: {
-            target: 'es2020',
+            target: 'esnext',
         },
     },
     build: {
-        target: 'es2020',
+        target: 'esnext',
     },
     server: {
         port: 3000,

@@ -1,0 +1,32 @@
+# Prover inputs for testing the battleship proof circuit
+# This file provides example inputs for generating a test proof.
+
+# Private: 10x10 fleet grid (1 = ship, 0 = empty)
+# Layout: Carrier(5) at row0, Battleship(4) at row1, Cruiser(3) at row2,
+#         Submarine(3) at row3, Destroyer(2) at row4
+fleet_grid = [
+    1, 1, 1, 1, 1, 0, 0, 0, 0, 0,
+    1, 1, 1, 1, 0, 0, 0, 0, 0, 0,
+    1, 1, 1, 0, 0, 0, 0, 0, 0, 0,
+    1, 1, 1, 0, 0, 0, 0, 0, 0, 0,
+    1, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+]
+
+# Private: random salt/nonce
+salt = "12345"
+
+# Public: commitment hash (computed from fleet_grid + salt via Poseidon2)
+# This value must be computed by running the circuit first with nargo execute
+commitment = ""
+
+# Public: shot coordinates (0-indexed)
+shot_x = "0"
+shot_y = "0"
+
+# Public: response (1 = hit, 0 = miss)
+response = "1"

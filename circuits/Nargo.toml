@@ -1,0 +1,7 @@
+[package]
+name = "battleship_proof"
+type = "bin"
+authors = ["ZK Battleship Team"]
+compiler_version = ">=1.0.0-beta.18"
+
+[dependencies]
